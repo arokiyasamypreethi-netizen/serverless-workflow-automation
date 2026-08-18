@@ -1,0 +1,183 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Serverless Workflow Automation Project
+
+Parameters:
+  NotificationEmail:
+    Type: String
+    Description: Email address to receive SNS notifications
+
+Resources:
+
+  #########################################
+  # SNS Topic
+  #########################################
+
+  NotificationTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: ServerlessWorkflowTopic
+
+  EmailSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      Protocol: email
+      Endpoint: !Ref NotificationEmail
+      TopicArn: !Ref NotificationTopic
+
+  #########################################
+  # IAM Role
+  #########################################
+
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: ServerlessWorkflowLambdaRole
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - sts:AssumeRole
+
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+
+      Policies:
+        - PolicyName: SQSAndSNSPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+
+              - Effect: Allow
+                Action:
+                  - sns:Publish
+                Resource: !Ref NotificationTopic
+
+              - Effect: Allow
+                Action:
+                  - sqs:ReceiveMessage
+                  - sqs:DeleteMessage
+                  - sqs:GetQueueAttributes
+                Resource: "*"
+
+  #########################################
+  # Lambda Function
+  #########################################
+
+  ProcessingLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: ServerlessWorkflowProcessor
+      Runtime: python3.13
+      Handler: index.lambda_handler
+      Timeout: 30
+      Role: !GetAtt LambdaExecutionRole.Arn
+
+      Environment:
+        Variables:
+          SNS_TOPIC_ARN: !Ref NotificationTopic
+
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import os
+
+          sns = boto3.client('sns')
+
+          def lambda_handler(event, context):
+
+              for record in event['Records']:
+
+                  body = json.loads(record['body'])
+
+                  name = body.get("name","Unknown")
+                  department = body.get("department","Unknown")
+                  project = body.get("project","Unknown")
+
+                  message = f"""
+                  Processing Successful
+
+                  Name: {name}
+                  Department: {department}
+                  Project: {project}
+                  """
+
+                  print(message)
+
+                  sns.publish(
+                      TopicArn=os.environ['SNS_TOPIC_ARN'],
+                      Subject="Lambda Processing Completed",
+                      Message=message
+                  )
+
+              return {
+                  "statusCode":200,
+                  "body":"Success"
+              }
+
+  #########################################
+  # SQS Queue
+  #########################################
+
+  WorkflowQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: ServerlessWorkflowQueue
+
+  #########################################
+  # Event Source Mapping
+  #########################################
+
+  SQSTrigger:
+    Type: AWS::Lambda::EventSourceMapping
+    Properties:
+      BatchSize: 1
+      Enabled: true
+      EventSourceArn: !GetAtt WorkflowQueue.Arn
+      FunctionName: !Ref ProcessingLambda
+
+  #########################################
+  # CloudWatch Alarm
+  #########################################
+
+  LambdaErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: LambdaErrorAlarm
+
+      MetricName: Errors
+      Namespace: AWS/Lambda
+
+      Statistic: Sum
+
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref ProcessingLambda
+
+      AlarmActions:
+        - !Ref NotificationTopic
+
+Outputs:
+
+  QueueURL:
+    Description: SQS Queue URL
+    Value: !Ref WorkflowQueue
+
+  QueueARN:
+    Description: Queue ARN
+    Value: !GetAtt WorkflowQueue.Arn
+
+  LambdaName:
+    Value: !Ref ProcessingLambda
+
+  TopicARN:
+    Value: !Ref NotificationTopic
